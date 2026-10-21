@@ -119,6 +119,30 @@ results" signal for a paginated read.
 
 ---
 
+### `get_ranked_page`
+
+```rust
+pub fn get_ranked_page(env: Env, limit: u32, offset: u32, snapshot: Option<u32>) -> Result<LeaderboardPage, Error>
+```
+
+Use this view for multi-page reads. Start with `offset = 0, snapshot = None`;
+reuse the returned `snapshot` on every subsequent request, including backward
+navigation. It identifies the ranking revision using the successful result
+count, and the response includes both `snapshot` and `entries`.
+
+A result recorded between requests invalidates the token. The contract returns
+`SnapshotChanged` before returning any rows. Discard the page set and restart
+at offset zero with `None`; the frontend provides a restart button. This is
+optimistic consistent pagination, not retained historical snapshots. The legacy
+`get_leaderboard` remains available for individual reads but cannot guarantee
+consistency across requests. Both views use the same ordering and page limits.
+A missing token with a nonzero offset returns `InvalidRange`.
+
+The frontend requires a deployed contract exposing this new view. Deploy the
+contract update before releasing the frontend change.
+
+---
+
 ### `get_stats`
 
 ```rust
@@ -140,6 +164,12 @@ pub fn remove_source(env: Env, source: Address, caller: Address) -> Result<(), E
 Admin-only. `add_source` authorises an extra relayer, for example during a
 failover; `remove_source` revokes one. Results a source already recorded are
 untouched — revoking write permission is not a rollback.
+
+Granting an already-authorised source (including the initial source) returns
+`DuplicateSource` without changing storage or publishing an event. A revoked
+source may be granted again. Removing an unknown source returns `Unauthorized`.
+Both successful operations identify `(source, caller)` in event data; their
+`src_add` and `src_del` topics distinguish grant from revoke.
 
 ---
 
@@ -173,6 +203,9 @@ rebuilding state.
 | 4 | `InvalidResult` | Same player on both sides, or negative payout |
 | 5 | `InvalidRange` | `limit` is zero, or `offset` is past the end |
 | 6 | `ContractPaused` | Result recording is paused |
+| 7 | `DuplicateSource` | Reporter is already authorised |
+| 8 | `SnapshotChanged` | Ranking revision expired; restart pagination |
+| 9 | `ResultCountOverflow` | No further unique ranking revision can be allocated |
 
 ## Events
 
@@ -180,9 +213,13 @@ rebuilding state.
 |---|---|
 | `("admin", "init")` | `(admin, source)` |
 | `("admin", "src_add")` | `(source, caller)` |
-| `("admin", "src_del")` | `(caller)` |
+| `("admin", "src_del")` | `(source, caller)` |
 | `("admin", "pause_set")` | `(paused, caller)` |
 | `("result", "recorded")` | `(player1, player2, outcome, payout, token, result_count)` |
+
+The revoke payload now matches the grant payload. Indexers consuming the old
+single-caller revoke payload must update their decoder when deploying this
+contract version. Duplicate grant attempts emit no successful policy event.
 
 ## Security notes
 

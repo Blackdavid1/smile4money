@@ -1,19 +1,26 @@
-import { useEffect, useState } from 'react';
-import { Account, Networks, Operation, TransactionBuilder, nativeToScVal, rpc, scValToNative } from '@stellar/stellar-sdk';
+import { useEffect, useRef, useState } from 'react';
+import {
+  Account,
+  Networks,
+  Operation,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+} from '@stellar/stellar-sdk';
 
 /**
  * Leaderboard page â€” issue #124 / #1803.
  *
- * Renders the on-chain `get_leaderboard(limit, offset)` view produced by the
+ * Renders the on-chain `get_ranked_page(limit, offset, snapshot)` view produced by the
  * `smile4money-leaderboard` contract.
  *
  * ## Why a simulate rather than a signed call
  *
  * `get_leaderboard` is read-only, so it is invoked through
- * `simulateTransaction` â€” the same pattern `DepositStake` uses to read
- * `get_match`. No wallet signature is needed, so the page renders for visitors
- * who have not connected. The simulation source only has to exist on the
- * ledger; the contract's own address is used, which works with no wallet.
+ * `simulateTransaction`. No wallet signature is needed, so the page renders
+ * for visitors who have not connected. Simulation uses a fixed public account
+ * identifier and a dummy sequence number.
  *
  * ## Ranking and paging are server-side
  *
@@ -41,12 +48,17 @@ export interface LeaderboardEntry {
   stats: LeaderboardStats;
 }
 
+export interface LeaderboardPage {
+  snapshot: number;
+  entries: LeaderboardEntry[];
+}
+
 interface LeaderboardProps {
   contractId: string;
   rpcUrl?: string;
   networkPassphrase?: string;
   /** Injectable for tests; defaults to a real Soroban RPC simulation. */
-  fetchPage?: (limit: number, offset: number) => Promise<LeaderboardEntry[]>;
+  fetchPage?: (limit: number, offset: number, snapshot?: number) => Promise<LeaderboardPage>;
 }
 
 type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -64,6 +76,10 @@ export function decodeEntries(retval: unknown): LeaderboardEntry[] {
     throw new Error('Unexpected response from LeaderboardContract.get_leaderboard');
   }
 
+  return parseEntries(raw);
+}
+
+function parseEntries(raw: unknown[]): LeaderboardEntry[] {
   return raw.map((row) => {
     const entry = row as Record<string, unknown>;
     const stats = entry.stats as Record<string, unknown> | undefined;
@@ -85,27 +101,30 @@ export function decodeEntries(retval: unknown): LeaderboardEntry[] {
   });
 }
 
-/** Default read path: simulate a `get_leaderboard` call over Soroban RPC. */
+/** Revision-checked reads reject changed rankings; restart pagination on failure. */
 export async function fetchLeaderboardPage(
   contractId: string,
   limit: number,
   offset: number,
   rpcUrl: string,
   networkPassphrase: string,
-): Promise<LeaderboardEntry[]> {
+  snapshot?: number,
+): Promise<LeaderboardPage> {
   const server = new rpc.Server(rpcUrl);
-  // The contract's own address is used as the simulation source. It only has
-  // to exist on the ledger for a read-only simulation, so this works with no
-  // wallet connected. Constructing an `Account` with a dummy sequence is the
-  // same approach `DepositStake` uses to read `get_match`.
-  const source = new Account(contractId, '0');
+  // A transaction source must be a G-address, whereas contractId is a C-address.
+  // Simulation needs neither a funded account nor a signature.
+  const source = new Account('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF', '0');
 
   const tx = new TransactionBuilder(source, { fee: '100', networkPassphrase })
     .addOperation(
       Operation.invokeContractFunction({
         contract: contractId,
-        function: 'get_leaderboard',
-        args: [nativeToScVal(limit, { type: 'u32' }), nativeToScVal(offset, { type: 'u32' })],
+        function: 'get_ranked_page',
+        args: [
+          nativeToScVal(limit, { type: 'u32' }),
+          nativeToScVal(offset, { type: 'u32' }),
+          snapshot === undefined ? nativeToScVal(null) : nativeToScVal(snapshot, { type: 'u32' }),
+        ],
       }),
     )
     .setTimeout(30)
@@ -118,7 +137,11 @@ export async function fetchLeaderboardPage(
   if (!sim.result?.retval) {
     throw new Error('Could not load the leaderboard: the RPC server returned no result');
   }
-  return decodeEntries(sim.result.retval);
+  const raw = scValToNative(sim.result.retval) as Record<string, unknown>;
+  if (!raw || !Number.isInteger(raw.snapshot) || !Array.isArray(raw.entries)) {
+    throw new Error('Unexpected leaderboard page shape');
+  }
+  return { snapshot: Number(raw.snapshot), entries: parseEntries(raw.entries) };
 }
 
 /** Shorten an address for display, e.g. `GABCâ€¦WXYZ`. */
@@ -142,6 +165,10 @@ export function Leaderboard({
   fetchPage,
 }: LeaderboardProps) {
   const [page, setPage] = useState(0);
+  const [refresh, setRefresh] = useState(0);
+  const revision = useRef<{ context: string; fetcher: typeof fetchPage; snapshot: number } | null>(
+    null,
+  );
   // Results and errors are stored together with the request that produced
   // them, so `status` can be derived rather than tracked separately. Keying
   // them is what stops a slow page-1 response from painting rows under the
@@ -150,7 +177,8 @@ export function Leaderboard({
   const [failed, setFailed] = useState<{ key: string; message: string } | null>(null);
 
   const offset = page * PAGE_SIZE;
-  const requestKey = `${contractId}|${rpcUrl}|${networkPassphrase}|${offset}`;
+  const context = `${contractId}|${rpcUrl}|${networkPassphrase}|${refresh}`;
+  const requestKey = `${context}|${offset}`;
 
   useEffect(() => {
     // Nothing configured to read from. The derived status below already
@@ -161,14 +189,27 @@ export function Leaderboard({
     // paged away, which would render the previous page under the new page.
     let active = true;
 
+    const previous = revision.current;
+    const sameContext = previous?.context === context && previous.fetcher === fetchPage;
+    const snapshot = sameContext ? previous.snapshot : undefined;
+    // A changed contract/network starts a fresh page set.
+    if (!sameContext && offset !== 0) {
+      setPage(0);
+      return;
+    }
     const load = fetchPage
-      ? fetchPage(PAGE_SIZE, offset)
-      : fetchLeaderboardPage(contractId, PAGE_SIZE, offset, rpcUrl, networkPassphrase);
+      ? fetchPage(PAGE_SIZE, offset, snapshot)
+      : fetchLeaderboardPage(contractId, PAGE_SIZE, offset, rpcUrl, networkPassphrase, snapshot);
 
     load
-      .then((rows) => {
+      .then((result) => {
         if (!active) return;
-        setLoaded({ key: requestKey, rows });
+        if (snapshot !== undefined && result.snapshot !== snapshot) {
+          throw new Error('Leaderboard changed. Restart to load the current ranking.');
+        }
+        revision.current = { context, fetcher: fetchPage, snapshot: result.snapshot };
+        setFailed(null);
+        setLoaded({ key: requestKey, rows: result.entries });
       })
       .catch((err: unknown) => {
         if (!active) return;
@@ -182,10 +223,9 @@ export function Leaderboard({
       active = false;
     };
     // `requestKey` encodes every input this load depends on.
-  }, [contractId, rpcUrl, networkPassphrase, fetchPage, offset, requestKey]);
+  }, [contractId, rpcUrl, networkPassphrase, fetchPage, offset, requestKey, context]);
 
-  // Derived rather than stored, so no synchronous setState is needed in the
-  // effect body.
+  // Derive status from the response key so stale pages cannot render.
   const status: LoadStatus = !contractId
     ? 'idle'
     : failed?.key === requestKey
@@ -194,7 +234,7 @@ export function Leaderboard({
         ? 'ready'
         : 'loading';
 
-  const entries = loaded?.key === requestKey ? loaded.rows : [];
+  const entries = status === 'ready' && loaded ? loaded.rows : [];
   const error = failed?.key === requestKey ? failed.message : null;
 
   // A short page means this is the last one, so Next is disabled rather than
@@ -204,6 +244,7 @@ export function Leaderboard({
   return (
     <section className="leaderboard" data-testid="leaderboard">
       <h2 className="leaderboard-title">Leaderboard</h2>
+      <p>Ranked by wins descending, earnings descending, then Stellar address ascending.</p>
 
       {status === 'loading' && (
         <p className="loading-message" data-testid="leaderboard-loading">
@@ -212,9 +253,18 @@ export function Leaderboard({
       )}
 
       {status === 'error' && (
-        <p className="feedback error" role="alert" data-testid="leaderboard-error">
-          {error}
-        </p>
+        <div className="feedback error" role="alert" data-testid="leaderboard-error">
+          <p>{error}</p>
+          <button
+            type="button"
+            onClick={() => {
+              setPage(0);
+              setRefresh((value) => value + 1);
+            }}
+          >
+            Restart leaderboard
+          </button>
+        </div>
       )}
 
       {status === 'ready' && entries.length === 0 && (
@@ -255,10 +305,7 @@ export function Leaderboard({
                     <td>
                       {formatAmount(entry.stats.earnings)}
                       {entry.stats.token && (
-                        <span className="address-small">
-                          {' '}
-                          {shortAddress(entry.stats.token)}
-                        </span>
+                        <span className="address-small"> {shortAddress(entry.stats.token)}</span>
                       )}
                     </td>
                   </tr>

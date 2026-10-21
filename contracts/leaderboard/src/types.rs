@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Vec};
 
 /// Errors returned by the leaderboard contract.
 ///
@@ -10,6 +10,9 @@ use soroban_sdk::{contracterror, contracttype, Address};
 /// |  4   | InvalidResult    | Result is not a recognised variant             |
 /// |  5   | InvalidRange     | `limit` is zero or the page offset is past the end |
 /// |  6   | ContractPaused   | Result recording is paused                     |
+/// |  7   | DuplicateSource  | Reporter is already authorised                 |
+/// |  8   | SnapshotChanged  | Ranking changed; restart pagination            |
+/// |  9   | ResultCountOverflow | Ranking revision space exhausted            |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -30,6 +33,15 @@ pub enum Error {
 
     /// [E006] Result recording is paused.
     ContractPaused = 6,
+
+    /// [E007] This reporter is already authorised; no changes were made.
+    DuplicateSource = 7,
+
+    /// [E008] A result changed the ranking; restart pagination at offset zero.
+    SnapshotChanged = 8,
+
+    /// [E009] No further unique ranking revision can be allocated.
+    ResultCountOverflow = 9,
 }
 
 /// The outcome of a single match, as reported by the escrow contract.
@@ -99,6 +111,15 @@ pub struct LeaderboardEntry {
     pub player: Address,
     /// The player's lifetime record.
     pub stats: PlayerStats,
+}
+
+/// One revision-checked leaderboard page. A revision is not a historical read:
+/// subsequent requests must use this token or restart if it has expired.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaderboardPage {
+    pub snapshot: u32,
+    pub entries: Vec<LeaderboardEntry>,
 }
 
 /// Storage keys.
